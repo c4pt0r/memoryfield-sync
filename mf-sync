@@ -278,7 +278,7 @@ def main():
                             % fld).strip())
             print(psql(dsn, "select (select count(*) from memoryfield.pages where field=%s) pages,"
                             " (select count(*) from memoryfield.pages_deleted where field=%s) tombstones,"
-                            " coalesce(max(synced_at),'epoch')::text last_sync"
+                            " coalesce(max(finished_at),'epoch')::text last_run"
                             " from memoryfield.sync_runs where field=%s and ok;" % (fld, fld, fld)).strip())
             print(psql(dsn, "select to_char(started_at,'MM-DD HH24:MI:SS') started, mode, ok,"
                             " scanned, upserted, pulled, conflicts, tombstoned"
