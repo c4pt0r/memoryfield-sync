@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+"""mf-sync — sync a memoryfield (local Markdown memory pages) with a db9 database.
+
+db9 acts as the hub: every machine pushes its changes and pulls everyone else's,
+so the same memoryfield can live on several machines.
+
+usage:
+  mf-sync                 push local changes only (safe default)
+  mf-sync --sync          bidirectional: pull remote changes, then push local ones
+  mf-sync --pull          pull remote changes only (no writes to the db)
+  mf-sync --check         exit 1 if local and remote disagree
+  mf-sync --status        print mirror summary (rows, hosts, tombstones, last runs)
+  mf-sync --dry-run       print what --sync would do, change nothing
+  --db NAME               db9 database (default: memoryfield, env MEMORYFIELD_DB9)
+  --field PATH            memoryfield dir (remote rows keyed by its basename;
+                          env MEMORYFIELD, default ~/.memoryfields/work)
+  --host NAME             identity written into updated_by (default: hostname)
+  --full                  push every page regardless of local state cache
+  --with-fs               additionally copy raw .md files into the db9 filesystem
+  --strict                exit non-zero on failure (default: warn, exit 0 — hooks
+                          must never break a page write)
+
+Conflict policy (see README): a page both machines edited since the last sync is
+never overwritten. The incoming version is dropped into <field>/.conflicts/ and
+the run exits non-zero under --strict so the timer log shows it.
+"""
+from __future__ import annotations
+import argparse, base64, datetime, hashlib, json, os, re, socket, subprocess, sys, tempfile
+
+DEFAULT_FIELD = os.path.expanduser(os.environ.get("MEMORYFIELD", "~/.memoryfields/work"))
+DEFAULT_DB = os.environ.get("MEMORYFIELD_DB9", "memoryfield")
+HERE = os.path.dirname(os.path.abspath(os.path.realpath(__file__)))
+SCHEMA_SQL = os.path.join(HERE, "mf-sync-schema.sql")
+
+FM_RE = re.compile(r"^---\s*$")
+KEY_RE = re.compile(r"^(title|summary|status|status_reason|uuid|created|updated)\s*:\s*(.*)$")
+
+
+def q(s):
+    if s is None:
+        return "NULL"
+    return "'" + str(s).replace("\x00", "").replace("'", "''") + "'"
+
+
+def ts(s):
+    if not s:
+        return None
+    s = s.strip().strip("'\"")
+    try:
+        d = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=datetime.timezone.utc)
+        return d.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
+
+
+def parse_page(path):
+    raw = open(path, "rb").read()
+    try:
+        text = raw.decode("utf-8", "strict")
+    except Exception:
+        text = raw.decode("utf-8", "ignore")
+    meta, in_fm = {}, False
+    for line in text.splitlines()[:60]:
+        if FM_RE.match(line):
+            if not in_fm:
+                in_fm = True
+                continue
+            break
+        if in_fm:
+            m = KEY_RE.match(line)
+            if m:
+                meta[m.group(1)] = m.group(2).strip()
+    status = re.sub(r"^\[|\]$", "", meta.get("status", ""))
+    return {
+        "slug": os.path.basename(path)[:-3],
+        "title": meta.get("title", ""),
+        "summary": meta.get("summary", ""),
+        "status": status,
+        "status_reason": meta.get("status_reason", ""),
+        "uuid": meta.get("uuid", ""),
+        "page_created": ts(meta.get("created", "")),
+        "page_updated": ts(meta.get("updated", "")),
+        "bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "body": text,
+    }
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def get_dsn(db):
+    r = run(["db9", "db", "connect", db, "--quiet"])
+    if r.returncode != 0:
+        raise RuntimeError("db9 db connect failed: " + (r.stderr or r.stdout).strip()[:300])
+    dsn = (r.stdout or "").strip().splitlines()[-1].strip()
+    if "://" not in dsn:
+        raise RuntimeError("no DSN in db9 output: " + dsn[:200])
+    return dsn
+
+
+def psql(dsn, sql):
+    with tempfile.NamedTemporaryFile("w", suffix=".sql", delete=False, encoding="utf-8") as f:
+        f.write(sql)
+        path = f.name
+    try:
+        r = run(["psql", dsn, "-v", "ON_ERROR_STOP=1", "-q", "-f", path])
+        if r.returncode != 0:
+            raise RuntimeError("psql failed: " + (r.stderr or r.stdout).strip()[:500])
+        return r.stdout
+    finally:
+        os.unlink(path)
+
+
+def psql_at(dsn, sql):
+    r = run(["psql", dsn, "-v", "ON_ERROR_STOP=1", "-q", "-At", "-c", sql])
+    if r.returncode != 0:
+        raise RuntimeError("psql failed: " + (r.stderr or r.stdout).strip()[:500])
+    return r.stdout
+
+
+def scalar(dsn, sql):
+    return psql_at(dsn, sql).strip()
+
+
+def b64(s):
+    return base64.b64encode(s.encode("utf-8")).decode("ascii")
+
+
+# db9 gotcha: decode(hex,'hex')::text stores the literal "\x<hex>" string.
+# convert_from(decode(...),'UTF8') is what actually yields real text.
+def textlit(s):
+    return "convert_from(decode('%s','hex'),'UTF8')" % s.encode("utf-8").hex()
+
+
+def upsert_sql(rows, field, host):
+    out = []
+    for p in rows:
+        vals = [q(field), q(p["slug"]), q(p["title"]), q(p["summary"]), q(p["status"]),
+                q(p["status_reason"]), q(p["uuid"]), q(p["page_created"]), q(p["page_updated"]),
+                str(p["bytes"]), q(p["sha256"]), textlit(p["body"]), q(host), "now()"]
+        out.append(
+            "insert into memoryfield.pages (field,slug,title,summary,status,status_reason,uuid,"
+            "page_created,page_updated,bytes,sha256,body,updated_by,synced_at)\n values ("
+            + ", ".join(vals)
+            + ")\n on conflict (field,slug) do update set title=excluded.title,"
+            " summary=excluded.summary, status=excluded.status, status_reason=excluded.status_reason,"
+            " uuid=excluded.uuid, page_created=excluded.page_created,"
+            " page_updated=excluded.page_updated, bytes=excluded.bytes, sha256=excluded.sha256,"
+            " body=excluded.body, updated_by=excluded.updated_by, synced_at=now();")
+    return "\n".join(out)
+
+
+def ensure_schema(dsn):
+    """create tables, add columns that newer versions introduced (never drops data)"""
+    psql(dsn, open(SCHEMA_SQL).read())
+    for t, c, ty in (("pages", "updated_by", "text"),
+                     ("pages_deleted", "deleted_by", "text"),
+                     ("sync_runs", "field", "text"),
+                     ("sync_runs", "host", "text"),
+                     ("sync_runs", "pulled", "integer default 0"),
+                     ("sync_runs", "conflicts", "integer default 0")):
+        psql(dsn, "alter table memoryfield.%s add column if not exists %s %s;" % (t, c, ty))
+
+
+def remote_rows(dsn, fld):
+    """slug -> {sha, updated_by, synced_at}"""
+    out = {}
+    for line in psql_at(dsn, "select slug||chr(9)||coalesce(sha256,'-')||chr(9)"
+                             "||coalesce(updated_by,'-')||chr(9)||coalesce(synced_at,'epoch')"
+                             "::text from memoryfield.pages where field=%s;" % fld).splitlines():
+        parts = line.split("\t")
+        if len(parts) == 4 and len(parts[1]) == 64:
+            out[parts[0]] = {"sha": parts[1], "by": parts[2], "synced": parts[3]}
+    return out
+
+
+def remote_bodies(dsn, fld, slugs):
+    """slug -> body text (base64 over the wire: no newline/quoting ambiguity)"""
+    got = {}
+    for i in range(0, len(slugs), 10):
+        chunk = slugs[i:i + 10]
+        # Postgres encode(...,'base64') inserts a newline every 64 chars -> strip it,
+        # otherwise one row spans many lines and parsing breaks.
+        sql = ("select slug||chr(9)||replace(encode(convert_to(body,'UTF8'),'base64'),chr(10),'')"
+               " from memoryfield.pages where field=%s and slug in (%s);"
+               % (fld, ", ".join(q(s) for s in chunk)))
+        for line in psql_at(dsn, sql).splitlines():
+            parts = line.split("\t")
+            if len(parts) == 2:
+                try:
+                    got[parts[0]] = base64.b64decode(parts[1]).decode("utf-8")
+                except Exception:
+                    pass
+    return got
+
+
+def remote_tombstones(dsn, fld):
+    out = {}
+    for line in psql_at(dsn, "select slug||chr(9)||coalesce(deleted_by,'-')||chr(9)"
+                             "||coalesce(deleted_at,'epoch')::text from memoryfield.pages_deleted"
+                             " where field=%s;" % fld).splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3:
+            out[parts[0]] = {"by": parts[1], "at": parts[2]}
+    return out
+
+
+def write_local(field, slug, body, sha, subdir=".conflicts", suffix=""):
+    d = os.path.join(field, subdir) if subdir else field
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, slug + suffix + ".md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(body)
+    ok = hashlib.sha256(body.encode("utf-8")).hexdigest() == sha
+    return path, ok
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--db", default=DEFAULT_DB)
+    ap.add_argument("--field", default=DEFAULT_FIELD)
+    ap.add_argument("--host", default=socket.gethostname())
+    ap.add_argument("--full", action="store_true")
+    ap.add_argument("--status", action="store_true")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--pull", action="store_true")
+    ap.add_argument("--sync", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--with-fs", action="store_true")
+    ap.add_argument("--strict", action="store_true")
+    a = ap.parse_args()
+    start = int(datetime.datetime.now().timestamp())
+
+    field = os.path.abspath(os.path.expanduser(a.field))
+    if not os.path.isdir(field):
+        print("no such field: %s" % field, file=sys.stderr)
+        return 2
+    fldname = os.path.basename(field)
+    fld = q(fldname)
+    state_path = os.path.join(field, ".db9-sync-state.json")
+    try:
+        state = json.load(open(state_path))
+    except Exception:
+        state = {}
+
+    local = {}
+    for fn in sorted(os.listdir(field)):
+        if fn.endswith(".md"):
+            p = parse_page(os.path.join(field, fn))
+            local[p["slug"]] = p
+    dsn = None
+    conflicts = []
+
+    try:
+        dsn = get_dsn(a.db)
+        # pre-(field,slug) tables get rebuilt; local field is the source of truth for its rows
+        if scalar(dsn, "select count(*) from information_schema.tables where table_schema='memoryfield'"
+                       " and table_name='pages';") != "0":
+            cols = scalar(dsn, "select count(*) from information_schema.columns where"
+                               " table_schema='memoryfield' and table_name='pages'"
+                               " and column_name='field';")
+            if cols == "0":
+                psql(dsn, "drop table if exists memoryfield.pages;"
+                          " drop table if exists memoryfield.pages_deleted;"
+                          " drop table if exists memoryfield.sync_runs;")
+                a.full = True
+                print("[mf-sync] rebuilt tables with (field,slug) PK", file=sys.stderr)
+        ensure_schema(dsn)
+
+        if a.status:
+            print("[mf-sync] db=%s field=%s local_pages=%d" % (a.db, fldname, len(local)))
+            print(psql(dsn, "select updated_by, count(*) pages, max(synced_at) last_push"
+                            " from memoryfield.pages where field=%s group by 1 order by 3 desc nulls last;"
+                            % fld).strip())
+            print(psql(dsn, "select (select count(*) from memoryfield.pages where field=%s) pages,"
+                            " (select count(*) from memoryfield.pages_deleted where field=%s) tombstones,"
+                            " coalesce(max(synced_at),'epoch')::text last_sync"
+                            " from memoryfield.sync_runs where field=%s and ok;" % (fld, fld, fld)).strip())
+            print(psql(dsn, "select to_char(started_at,'MM-DD HH24:MI:SS') started, mode, ok,"
+                            " scanned, upserted, pulled, conflicts, tombstoned"
+                            " from memoryfield.sync_runs where field=%s order by id desc limit 5;" % fld).strip())
+            return 0
+
+        rrows = remote_rows(dsn, fld)
+        tombs = remote_tombstones(dsn, fld)
+
+        if a.check:
+            bad = scalar(dsn, "select count(*) from memoryfield.pages where field=%s"
+                              " and sha256 <> encode(sha256(convert_to(body,'UTF8')),'hex');" % fld)
+            if bad != "0":
+                print("remote body/sha256 mismatch on %s pages (run mf-sync --full)" % bad, file=sys.stderr)
+                return 1
+            drift = [s for s, p in local.items() if rrows.get(s, {}).get("sha") != p["sha256"]]
+            extra = [s for s in rrows if s not in local and s in state]
+            if drift or extra:
+                print("drift: local-differs=%d %s | remote-only=%d %s"
+                      % (len(drift), drift[:5], len(extra), extra[:5]), file=sys.stderr)
+                return 1
+            print("in sync: %d pages (field=%s db=%s)" % (len(local), fldname, a.db))
+            return 0
+
+        # ---- decide what goes which way ----
+        pull, push = [], []
+        pulled_slugs, honor_delete, honor_slugs = set(), [], set()
+        for s, r in rrows.items():
+            l = local.get(s)
+            base = state.get(s)
+            if l is None:
+                if s in state:
+                    push.append(("delete", s, None))          # deleted locally
+                else:
+                    pull.append((s, r["sha"], r["by"]))        # new from another machine
+                continue
+            if l["sha256"] == r["sha"]:
+                continue
+            if l["sha256"] == base:
+                pull.append((s, r["sha"], r["by"]))            # remote newer, we didn't touch it
+            elif r["sha"] == base:
+                push.append(("put", s, l))                     # we changed it, remote untouched
+            else:
+                conflicts.append((s, r["by"]))                 # both sides edited
+                pull.append((s, r["sha"], r["by"], True))      # keep ours, save theirs
+
+        for s, p in local.items():
+            if s in rrows:
+                continue
+            if s in tombs:
+                base = state.get(s)
+                if (a.sync or a.pull) and base is not None and p["sha256"] == base:
+                    honor_delete.append(s)          # a peer deleted it, we never touched it
+                else:
+                    conflicts.append((s, tombs[s]["by"]))
+                    push.append(("put", s, p))      # we edited it -> resurrect on the hub
+            else:
+                push.append(("put", s, p))
+
+        if a.pull or a.sync:
+            want = [x[0] for x in pull]
+            bodies = remote_bodies(dsn, fld, want)
+            for item in pull:
+                s, sha, by = item[0], item[1], item[2]
+                conflict = len(item) > 3 and item[3]
+                body = bodies.get(s)
+                if body is None:
+                    print("pull: %s missing from remote fetch, skipped" % s, file=sys.stderr)
+                    continue
+                if a.dry_run:
+                    print("would %s %s (from %s)" % ("CONFLICT-copy" if conflict else "PULL", s, by))
+                    continue
+                if conflict:
+                    path, ok = write_local(field, s, body, sha, subdir=".conflicts",
+                                           suffix="@%s" % by)
+                    print("conflict: kept local %s.md, incoming (from %s) -> %s%s"
+                          % (s, by, path, "" if ok else "  [sha mismatch!]"))
+                else:
+                    path, ok = write_local(field, s, body, sha, subdir="")
+                    if not ok:
+                        print("pull: %s wrote but sha mismatch" % s, file=sys.stderr)
+                    state[s] = sha
+                    pulled_slugs.add(s)
+            for s in honor_delete:
+                if a.dry_run:
+                    print("would HONOR-DELETE %s (deleted on hub)" % s)
+                    continue
+                path, _ = write_local(field, s, open(os.path.join(field, s + ".md")).read(),
+                                      "", subdir=".conflicts", suffix="@deleted")
+                os.unlink(os.path.join(field, s + ".md"))
+                state.pop(s, None)
+                honor_slugs.add(s)
+                print("honored remote delete: %s.md -> %s" % (s, path))
+        pulled = len(pulled_slugs) if not a.dry_run else \
+                 len([x for x in pull if not (len(x) > 3 and x[3])])
+
+        if a.pull:
+            push = []
+
+        if not a.dry_run:
+            tomb = 0
+            sql = []
+            for kind, s, p in push:
+                if kind == "put":
+                    continue
+                if s in tombs:
+                    continue
+                sql.append("insert into memoryfield.pages_deleted (field,slug,uuid,title,body,sha256,"
+                           "deleted_by,deleted_at) select field,slug,uuid,title,body,sha256,%s,now()"
+                           " from memoryfield.pages where field=%s and slug=%s"
+                           " on conflict (field,slug) do update set body=excluded.body,"
+                           " deleted_by=excluded.deleted_by, deleted_at=now();" % (q(a.host), fld, q(s)))
+                sql.append("delete from memoryfield.pages where field=%s and slug=%s;" % (fld, q(s)))
+                tomb += 1
+            if sql:
+                psql(dsn, "\n".join(sql))
+            rows = [p for kind, s, p in push if kind == "put"]
+            batch, up = [], 0
+            for p in rows:
+                batch.append(p)
+                if len(batch) >= 25:
+                    psql(dsn, upsert_sql(batch, fldname, a.host)); up += len(batch); batch = []
+            if batch:
+                psql(dsn, upsert_sql(batch, fldname, a.host)); up += len(batch)
+            # resurrect rows that came back after being tombstoned
+            rev = [x[0] for x in pull if x[0] in tombs]
+            if rev:
+                psql(dsn, "\n".join("delete from memoryfield.pages_deleted where field=%s and slug=%s;"
+                                    % (fld, q(s)) for s in rev))
+            psql(dsn, "insert into memoryfield.sync_runs (field,host,started_at,finished_at,scanned,"
+                      "upserted,pulled,conflicts,tombstoned,mode,ok,note) values (%s,%s,"
+                      " now() - interval '%d seconds', now(), %d, %d, %d, %d, %d, %s, true, null);"
+                      % (fld, q(a.host), max(1, int(datetime.datetime.now().timestamp()) - start),
+                         len(local), up, pulled, len(conflicts), tomb,
+                         q("sync" if a.sync else ("pull" if a.pull else "push"))))
+            for s, p in local.items():
+                if s in pulled_slugs or s in honor_slugs or s in [x[0] for x in conflicts]:
+                    continue
+                state[s] = p["sha256"]
+            for kind, s, p in push:
+                if kind == "delete":
+                    state.pop(s, None)
+            tmp = state_path + ".tmp"
+            json.dump(state, open(tmp, "w"), indent=0, sort_keys=True)
+            os.replace(tmp, state_path)
+
+            mode = "sync" if a.sync else ("pull" if a.pull else "push")
+            print("[mf-sync] db=%s field=%s host=%s mode=%s scanned=%d pushed=%d pulled=%d "
+                  "conflicts=%d tombstoned=%d deleted_locally=%d%s ok"
+                  % (a.db, fldname, a.host, mode, len(local),
+                     len([x for x in push if x[0] == "put"]), pulled, len(conflicts), tomb,
+                     len(honor_slugs), " DRY-RUN" if a.dry_run else ""))
+            if conflicts and a.strict:
+                return 1
+            return 0
+
+        print("[mf-sync] dry-run: pushed=%d pulled=%d conflicts=%d"
+              % (len(push), pulled, len(conflicts)))
+        return 0
+    except Exception as e:
+        print("[mf-sync] FAILED: %s" % e, file=sys.stderr)
+        if dsn and not (a.status or a.check):
+            try:
+                psql(dsn, "insert into memoryfield.sync_runs (field,host,started_at,finished_at,scanned,"
+                          "upserted,pulled,conflicts,tombstoned,mode,ok,note) values (%s,%s,now(),now(),"
+                          "%d,0,0,0,0,'%s',false,%s);"
+                          % (fld, q(a.host), len(local), "sync" if a.sync else "push", q(str(e)[:400])))
+            except Exception:
+                pass
+        return 1 if a.strict else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
