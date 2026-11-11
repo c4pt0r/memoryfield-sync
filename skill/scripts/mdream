@@ -164,13 +164,17 @@ hub-check)
 import glob,os,re,sys
 d=sys.argv[1]
 names={os.path.basename(p)[:-3] for p in glob.glob(os.path.join(d,"*.md"))}
-hub=os.path.join(d,"memoryfield-hub.md")
-if not os.path.exists(hub): print("no hub page: memoryfield-hub.md"); sys.exit(1)
+# hub = memoryfield-hub.md 加它的分区页 memoryfield-hub-<group>.md（hub 超 8192B 后拆出去的）
+hubs=[p for p in glob.glob(os.path.join(d,"*.md"))
+      if re.fullmatch(r"memoryfield-hub(-[a-z0-9]+)*", os.path.basename(p)[:-3])]
+if not hubs: print("no hub page: memoryfield-hub.md"); sys.exit(1)
 def body(p):
     t=open(p,encoding="utf-8",errors="ignore").read()
     return (t.split("---\n",2)[1],t) if t.startswith("---\n") else ("",t)
-hfm,hbody=body(hub)
-linked=set(re.findall(r"\[\[([a-z0-9-]+)\]\]",hbody))
+linked=set()
+for h in hubs:
+    _,hb=body(h)
+    linked|=set(re.findall(r"\[\[([a-z0-9-]+)\]\]",hb))
 nonobs=[]; dang={}
 for p in glob.glob(os.path.join(d,"*.md")):
     n=os.path.basename(p)[:-3]; fm,t=body(p)
@@ -178,8 +182,8 @@ for p in glob.glob(os.path.join(d,"*.md")):
     nonobs.append(n)
     for l in re.findall(r"\[\[([a-z0-9-]+)\]\]",t):
         if l not in names: dang.setdefault(n,[]).append(l)
-miss=sorted(set(nonobs)-linked-{"index","memoryfield-hub"})
-print(f"pages(non-obsolete)={len(nonobs)} hub_links={len(linked)}")
+miss=sorted(set(nonobs)-linked-{"index"}-{os.path.basename(p)[:-3] for p in hubs})
+print(f"hub_pages={len(hubs)} pages(non-obsolete)={len(nonobs)} hub_links={len(linked)}")
 print("hub 未收录:", miss or "none")
 print("死链:", dang or "none")
 PY

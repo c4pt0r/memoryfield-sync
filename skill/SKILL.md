@@ -25,7 +25,7 @@ metadata:
    `mf-sync --sync` 再 grep**（别的机器上刚写的页也能查到）。不用 `msearch`、自己 grep/awk/cat
    场里的页时，必须先手动 `mf-sync --sync`。未命中再凭印象答或重查；同步告警要告诉用户结果可能不新。
 2. 产生可复用事实/踩坑/已验证流程 → `mnew` 写页，**写完 `mf-sync --sync`**（见「同步」）。
-3. 结论变了**不删页**：标 `status:` + `status_reason:`，并改 `memoryfield-hub.md`。
+3. 结论变了**不删页**：标 `status:` + `status_reason:`，并改对应分区页 `memoryfield-hub-*.md`。
 4. 冲突不覆盖：`mf-sync` 只会把对端版本放进 `.conflicts/`，合并由你（或 agent）手工做。
 
 ## 检索
@@ -129,7 +129,10 @@ mf-sync --check
 - 结论变化时**不要删页**：frontmatter 加
   `status: [provisional|disputed|obsolete|superseded|refuted]`（可多值）+ `status_reason` 指明替代页。
   没有 `status` 不等于结论正确。
-- `index.md` 是主题说明，**禁止**当页面目录用。目录页是 `memoryfield-hub.md`，新页/作废页要同步改它。
+- `index.md` 是主题说明，**禁止**当页面目录用。目录是 hub 系列页：`memoryfield-hub.md`（只列分区页）
+  + `memoryfield-hub-<group>.md`（条目在这里，当前分区：agent / infra / pipeline / xp / life）。
+  新页/作废页改**对应分区页**；`mdream hub-check` 会把 hub + 全部 `memoryfield-hub-*` 一起算。
+  单页上限 8192B：hub 满了就拆分区页，不是删条目描述。
 
 ## 校验与离线整理（dreaming）
 
