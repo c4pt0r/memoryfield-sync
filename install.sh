@@ -7,6 +7,7 @@
 #   ./install.sh --db memoryfield --field ~/.memoryfields/work --interval 5
 #   ./install.sh --no-timer            # only install mf-sync
 #   ./install.sh --hooks               # also patch the local-memoryfield skill hooks (mnew/mdream)
+#   ./install.sh --skill               # also install/refresh the memoryfield SKILL.md from this repo
 #   ./install.sh --launchd             # force a macOS LaunchAgent (default on macOS)
 #   ./install.sh --cron                # crontab line instead of timer/LaunchAgent
 set -uo pipefail
@@ -30,6 +31,7 @@ while [ $# -gt 0 ]; do
     --cron)     USE_CRON=1; shift ;;
     --launchd)  USE_LAUNCHD=1; shift ;;
     --hooks)    HOOKS=1; shift ;;
+    --skill)    SKILL=1; shift ;;
     -h|--help)  sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
