@@ -41,6 +41,7 @@ cd ~/memoryfield-sync && ./install.sh          # symlink + systemd user timer (5
 | `--no-timer` | install the command only |
 | `--cron` | print a crontab line (used automatically if there is no systemd user instance) |
 | `--hooks` | append the `mf-sync --sync` hook to `mnew` / `mdream` if you have the memoryfield skill |
+| `--skill` | install/refresh `~/.agents/skills/local-memoryfield/SKILL.md` from `skill/SKILL.md` (old copy kept as `.bak.<ts>`) |
 
 It writes `~/.config/memoryfield-sync/env` (sourced by the systemd unit) and symlinks
 `mf-sync` into `~/.local/bin`.
@@ -86,6 +87,15 @@ mf-sync --with-fs       additionally copy raw .md into the db9 filesystem (/memo
 mf-sync --strict        non-zero exit on failure (default: warn and exit 0, so hooks never break)
 mf-sync --host NAME     identity recorded in `updated_by` (default: hostname)
 ```
+
+## The memoryfield skill (optional)
+
+`skill/SKILL.md` is the agent-facing instruction file for a memoryfield: how to search
+(`msearch`), how to write a page (`mnew`), page rules, and the sync/conflict workflow above.
+`./install.sh --skill` copies it into `~/.agents/skills/local-memoryfield/SKILL.md`
+(backing up whatever was there), so every machine's agent follows the same rules.
+Keep it in the repo rather than hand-editing it per machine — that is what makes machine N
+behave like machine 1.
 
 ## Merge semantics
 

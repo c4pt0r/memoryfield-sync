@@ -17,6 +17,7 @@ FIELD="${MEMORYFIELD:-$HOME/.memoryfields/work}"
 INTERVAL=5
 TIMER=1
 HOOKS=0
+SKILL=0
 USE_CRON=0
 USE_LAUNCHD=0
 
@@ -148,6 +149,24 @@ elif [ $TIMER = 1 ]; then
   echo "no systemd user instance; add this crontab line instead (note: cron's HOME/PATH are bare,"
   echo "  db9 needs HOME, so prefer the LaunchAgent above or set them in the line):"
   echo "  */$INTERVAL * * * * HOME=$HOME PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin $HERE/mf-sync --sync --strict --field $FIELD --db $DB >>$HOME/.memoryfield-sync-cron.log 2>&1"
+fi
+
+# --- optional: install/refresh the memoryfield skill from this repo ------------
+if [ $SKILL = 1 ]; then
+  SKDIR="$HOME/.agents/skills/local-memoryfield"
+  if [ -d "$SKDIR" ]; then
+    if [ -f "$HERE/skill/SKILL.md" ]; then
+      if ! cmp -s "$HERE/skill/SKILL.md" "$SKDIR/SKILL.md"; then
+        cp "$SKDIR/SKILL.md" "$SKDIR/SKILL.md.bak.$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null || true
+        cp "$HERE/skill/SKILL.md" "$SKDIR/SKILL.md"
+        echo "skill:      refreshed $SKDIR/SKILL.md (previous version kept as .bak.*; it is itself a memory page, diff it if you customized it)"
+      else
+        echo "skill:      SKILL.md already current"
+      fi
+    fi
+  else
+    echo "skill:      $SKDIR not found (no local-memoryfield skill on this machine) — skipping"
+  fi
 fi
 
 # --- optional skill hooks -----------------------------------------------------
