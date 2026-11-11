@@ -7,7 +7,7 @@
 #   ./install.sh --db memoryfield --field ~/.memoryfields/work --interval 5
 #   ./install.sh --no-timer            # only install mf-sync
 #   ./install.sh --hooks               # also patch the local-memoryfield skill hooks (mnew/mdream)
-#   ./install.sh --skill               # also install/refresh the memoryfield SKILL.md from this repo
+#   ./install.sh --skill               # also install/refresh the memoryfield skill (SKILL.md + mnew/msearch/mdream)
 #   ./install.sh --launchd             # force a macOS LaunchAgent (default on macOS)
 #   ./install.sh --cron                # crontab line instead of timer/LaunchAgent
 set -uo pipefail
@@ -156,19 +156,34 @@ fi
 # --- optional: install/refresh the memoryfield skill from this repo ------------
 if [ $SKILL = 1 ]; then
   SKDIR="$HOME/.agents/skills/local-memoryfield"
-  if [ -d "$SKDIR" ]; then
-    if [ -f "$HERE/skill/SKILL.md" ]; then
-      if ! cmp -s "$HERE/skill/SKILL.md" "$SKDIR/SKILL.md"; then
-        cp "$SKDIR/SKILL.md" "$SKDIR/SKILL.md.bak.$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null || true
-        cp "$HERE/skill/SKILL.md" "$SKDIR/SKILL.md"
-        echo "skill:      refreshed $SKDIR/SKILL.md (previous version kept as .bak.*; it is itself a memory page, diff it if you customized it)"
-      else
-        echo "skill:      SKILL.md already current"
-      fi
+  [ -d "$SKDIR" ] || { mkdir -p "$SKDIR" && echo "skill:      created $SKDIR"; }
+  if [ -f "$HERE/skill/SKILL.md" ]; then
+    if [ ! -f "$SKDIR/SKILL.md" ]; then
+      cp "$HERE/skill/SKILL.md" "$SKDIR/SKILL.md"
+      echo "skill:      installed $SKDIR/SKILL.md"
+    elif ! cmp -s "$HERE/skill/SKILL.md" "$SKDIR/SKILL.md"; then
+      cp "$SKDIR/SKILL.md" "$SKDIR/SKILL.md.bak.$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null || true
+      cp "$HERE/skill/SKILL.md" "$SKDIR/SKILL.md"
+      echo "skill:      refreshed $SKDIR/SKILL.md (previous version kept as .bak.*; it is itself a memory page, diff it if you customized it)"
+    else
+      echo "skill:      SKILL.md already current"
     fi
-  else
-    echo "skill:      $SKDIR not found (no local-memoryfield skill on this machine) — skipping"
   fi
+  # helper scripts (mnew/msearch/mdream) + symlinks back to this repo's mf-sync
+  mkdir -p "$SKDIR/scripts"
+  for s in mnew msearch mdream; do
+    src="$HERE/skill/scripts/$s"; dst="$SKDIR/scripts/$s"
+    [ -f "$src" ] || continue
+    if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+      echo "skill:      scripts/$s already current"
+    else
+      [ -f "$dst" ] && cp "$dst" "$dst.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+      cp "$src" "$dst" && chmod +x "$dst"
+      echo "skill:      installed scripts/$s"
+    fi
+  done
+  ln -sf "$HERE/mf-sync" "$SKDIR/scripts/mf-sync"
+  ln -sf "$HERE/mf-sync-schema.sql" "$SKDIR/scripts/mf-sync-schema.sql"
 fi
 
 # --- optional skill hooks -----------------------------------------------------

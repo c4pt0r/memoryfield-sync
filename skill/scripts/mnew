@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# mnew — 新建 memoryfield 页（自动生成合规 frontmatter：uuid / 引号包裹的 ISO 日期 / slug 文件名）
+# usage: mnew "Title" [--field PATH] [--name page-slug] [--summary S] [--force]
+set -uo pipefail
+
+FIELD="${MEMORYFIELD:-$HOME/.memoryfields/work}"
+title="" slug="" summary="" force=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --field)   FIELD="$2"; shift 2 ;;
+    --name)    slug="$2"; shift 2 ;;
+    --summary) summary="$2"; shift 2 ;;
+    --force)   force=1; shift ;;
+    -h|--help) sed -n '2,3p' "$0"; exit 0 ;;
+    *) [ -z "$title" ] && title="$1" || slug="$1"; shift ;;
+  esac
+done
+
+if [ -z "$title" ]; then
+  echo "usage: mnew \"Title\" [--field PATH] [--name page-slug] [--summary S] [--force]" >&2
+  exit 2
+fi
+if [ ! -d "$FIELD" ]; then
+  echo "no such field: $FIELD" >&2
+  exit 2
+fi
+
+# 文件名规则：小写 ASCII 字母/数字/连字符，首尾必须是字母或数字
+[ -z "$slug" ] && slug=$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]' \
+  | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
+if ! printf '%s' "$slug" | grep -qE '^[a-z0-9]+(-[a-z0-9]+)*$'; then
+  echo "非法 slug（需 ^[a-z0-9]+(-[a-z0-9]+)*\$，中文标题请显式传 --name）: $slug" >&2
+  exit 2
+fi
+
+page="$FIELD/$slug.md"
+if [ -e "$page" ] && [ "$force" != 1 ]; then
+  echo "已存在: $page（用 --force 覆盖；覆盖时请保留原 uuid/created）" >&2
+  exit 1
+fi
+
+# 覆盖时保留原 uuid 与 created，只刷新 updated
+uuid="" created=""
+if [ -f "$page" ]; then
+  uuid=$(awk -F': ' '/^uuid:/{print $2; exit}' "$page")
+  created=$(awk -F": '" "/^created:/{print \$(NF-1); exit}" "$page")
+fi
+[ -z "$uuid" ] && uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen | tr '[:upper:]' '[:lower:]')
+now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+[ -z "$created" ] && created="$now"
+
+tmp=$(mktemp)
+{
+  echo "---"
+  echo "title: $title"
+  echo "created: '$created'"
+  echo "updated: '$now'"
+  echo "uuid: $uuid"
+  [ -n "$summary" ] && echo "summary: $summary"
+  echo "---"
+  echo
+  echo "$title"
+  echo
+  echo "## 来源"
+  echo
+} > "$tmp"
+mv "$tmp" "$page"
+
+echo "$page"
+awk '/^---$/{f=!f;next} f && /^(uuid|created|updated):/' "$page"
+
+# 顺手把镜像推到 db9（后台，失败不影响建页结果；systemd timer 每 5min 兜底）
+nohup "${MF_SYNC:-$HOME/.local/bin/mf-sync}" --sync >/dev/null 2>&1 &   # mf-sync hook

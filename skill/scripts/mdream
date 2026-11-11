@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# mdream — memoryfield 的离线整理（dreaming）工具箱：体检 / 找重复 / 找易过期 / 改 status / 生成索引草稿 / 回查 transcript
+# usage:
+#   mdream audit                     格式体检 + 规模统计
+#   mdream dupes [--min N]           按标题/文件名聚类近重复页（默认 N=3）
+#   mdream stale [--top N]           按 updated 年龄排序，并标出含易过期断言（版本/IP/日期/集群名）的页
+#   mdream claims [slug]             列出页里的易过期断言行（不给 slug 则扫全场），供逐条复核
+#   mdream status --set VALUE --reason TXT --pages a.md,b.md [--also-drop 旧值]
+#                                    批量写 status/status_reason（不删页）
+#   mdream hub-dump [--group]        输出「- [[slug]] — summary [status]」草稿，供人工整理成 hub 页
+#   mdream hub-check                 检查 hub 是否漏收新页、以及 [[链]] 是否指向存在的页
+#   mdream evidence 词1 [词2 ...]    在会话 transcript（默认 ~/imessage-agent/sessions）里回查原始依据
+set -uo pipefail
+
+FIELD="${MEMORYFIELD:-$HOME/.memoryfields/work}"
+TRANS="${MEMORYFIELD_TRANSCRIPTS:-$HOME/imessage-agent/sessions}"
+sub="${1:-}"; shift || true
+
+field_ok() { [ -d "$FIELD" ] || { echo "no such field: $FIELD" >&2; exit 2; }; }
+
+# 提取 frontmatter 某字段（值去引号）
+fm() { awk -v k="$2" '/^---$/{f=!f;next} f && $0 ~ "^"k":" {sub("^"k":[[:space:]]*","");gsub(/^["'"'"']|["'"'"']$/,"");print;exit}' "$1"; }
+
+VOLATILE='([0-9]+\.[0-9]+\.[0-9]+|v[0-9]+\.[0-9]+|[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|[0-9]{4}-[0-9]{2}-[0-9]{2}|kube-context|docker ps|--version|kubectl config|100\.[0-9]+\.|192\.168\.|172\.[0-9]+\.)'
+
+cmd=${sub:-audit}
+case "$cmd" in
+audit)
+  field_ok
+  python3 - "$FIELD" <<'PY'
+import glob,re,os,sys,datetime
+d=sys.argv[1]; bad=0; rows=[]
+for p in sorted(glob.glob(os.path.join(d,"*.md"))):
+    n=os.path.basename(p); b=open(p,"rb").read(); t=b.decode(errors="ignore")
+    if not re.fullmatch(r'[a-z0-9]+(-[a-z0-9]+)*\.md',n): print("bad name",n); bad=1
+    if len(b)>8192: print("too big",n,len(b)); bad=1
+    fm=t.split("---\n",2)[1] if t.startswith("---\n") else ""
+    if not fm: print("no frontmatter",n); bad=1; continue
+    for k in ("title","uuid","created","updated","summary"):
+        if not re.search(rf"^{k}:",fm,re.M): print("missing",k,n); bad=1
+    for k in ("created","updated"):
+        v=re.search(rf"^{k}:\s*(.+)$",fm,re.M)
+        if v and not v.group(1).strip().startswith("'"): print("unquoted date",k,n); bad=1
+    up=(re.search(r"^updated:\s*'?([^'\n]+)",fm,re.M) or [None,"0000"])[1]
+    st=re.search(r"^status:",fm,re.M)
+    rows.append((up,n,len(b),bool(st)))
+print(f"pages={len(rows)} bytes={sum(r[2] for r in rows)} with_status={sum(1 for r in rows if r[3])} too_big={sum(1 for r in rows if r[2]>8192)}")
+print("oldest updated:")
+for up,n,sz,st in sorted(rows)[:10]: print(f"  {up}  {n}  {sz}B{'  [status]' if st else ''}")
+print("OK" if not bad else "有问题")
+PY
+  ;;
+dupes)
+  field_ok
+  min=3
+  while [ $# -gt 0 ]; do case "$1" in --min) min="$2"; shift 2;; *) shift;; esac; done
+  python3 - "$FIELD" "$min" <<'PY'
+import glob,os,re,sys,collections
+d,minc=sys.argv[1],int(sys.argv[2])
+g=collections.defaultdict(list)
+for p in glob.glob(os.path.join(d,"*.md")):
+    n=os.path.basename(p)
+    if n=="index.md": continue
+    stem=n[:-3]
+    key=re.sub(r'[-_]?(run|v)?\d+$','',stem)
+    key=re.sub(r'[-_]?[a-z]$','',key)
+    key=re.sub(r'-{2,}','-',key)
+    g[key].append(n)
+for k,v in sorted(g.items(), key=lambda kv:-len(kv[1])):
+    if len(v)>=minc:
+        print(f"[{len(v)}] {k}")
+        for n in sorted(v): print("   ",n)
+PY
+  ;;
+stale)
+  field_ok
+  top=15
+  while [ $# -gt 0 ]; do case "$1" in --top) top="$2"; shift 2;; *) shift;; esac; done
+  python3 - "$FIELD" "$top" <<PY
+import glob,os,re,sys
+d,top=sys.argv[1],int(sys.argv[2])
+vol=re.compile(r"$VOLATILE")
+rows=[]
+for p in glob.glob(os.path.join(d,"*.md")):
+    t=open(p,encoding="utf-8",errors="ignore").read()
+    fmseg=t.split("---\n",2)[1] if t.startswith("---\n") else ""
+    up=(re.search(r"^updated:\s*'?([^'\n]+)",fmseg,re.M) or [None,"0000"])[1][:10]
+    st=bool(re.search(r"^status:",fmseg,re.M))
+    body=t[400:] if t.startswith("---") else t
+    rows.append((up,os.path.basename(p),len(vol.findall(body)),st))
+rows.sort()
+print("updated        page                                              volatile_hits  has_status")
+for up,n,v,st in rows[:top]:
+    print(f"{up}  {n:<50} {v:>4}     {'yes' if st else 'NO'}")
+PY
+  ;;
+claims)
+  field_ok
+  slug="${1:-}"
+  if [ -n "$slug" ]; then files="$FIELD/$slug.md"; else files="$FIELD"/*.md; fi
+  for f in $files; do
+    n=$(basename "$f")
+    out=$(grep -nE "$VOLATILE" "$f" | grep -v "^2:created" | grep -v "^3:updated" | head -12)
+    [ -n "$out" ] && { echo "### $n"; echo "$out"; echo; }
+  done
+  ;;
+status)
+  field_ok
+  setv=""; reason=""; pages=""; drop=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --set) setv="$2"; shift 2 ;; --reason) reason="$2"; shift 2 ;;
+      --pages) pages="$2"; shift 2 ;; --also-drop) drop="$2"; shift 2 ;;
+      *) echo "unknown arg: $1" >&2; exit 2 ;;
+    esac
+  done
+  [ -z "$setv" ] || [ -z "$reason" ] || [ -z "$pages" ] && { echo "need --set/--reason/--pages" >&2; exit 2; }
+  IFS=',' read -ra arr <<< "$pages"
+  for p in "${arr[@]}"; do
+    f="$FIELD/$p"; [ -f "$f" ] || { echo "skip (not found): $p" >&2; continue; }
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    tmp=$(mktemp)
+    awk -v st="$setv" -v rs="$reason" -v now="$now" -v drop="$drop" '
+      BEGIN{in_fm=0;done_st=0;done_sr=0}
+      /^---$/{ in_fm=!in_fm; if(in_fm==0 && !done_st){print "status: " st; done_st=1}
+                                    if(in_fm==0 && !done_sr){print "status_reason: \x27" rs "\x27"; done_sr=1}
+              print; next }
+      in_fm==1 && /^status:/ { if(drop!="" && $0 ~ ("status:[^#]*" drop)) {print "status: " st; done_st=1; next} else {sub(/^status:.*/,"status: " st); done_st=1; print; next} }
+      in_fm==1 && /^status_reason:/ { sub(/^status_reason:.*/,"status_reason: \x27" rs "\x27"); done_sr=1; print; next }
+      in_fm==1 && /^updated:/ { print "updated: \x27" now "\x27"; next }
+      { print }' "$f" > "$tmp"
+    mv "$tmp" "$f"
+    echo "set status: $setv  <-  $p"
+  done
+  ;;
+hub-dump)
+  field_ok
+  python3 - "$FIELD" <<'PY'
+import glob,os,re,sys
+d=sys.argv[1]
+rows=[]
+for p in glob.glob(os.path.join(d,"*.md")):
+    n=os.path.basename(p)[:-3]
+    if n=="index": continue
+    t=open(p,encoding="utf-8",errors="ignore").read()
+    fm=t.split("---\n",2)[1] if t.startswith("---\n") else ""
+    g=lambda k:(re.search(rf"^{k}:\s*(.+)$",fm,re.M).group(1).strip("'\"") if re.search(rf"^{k}:\s*(.+)$",fm,re.M) else "")
+    st=g("status")
+    rows.append((n,g("title"),g("summary"),st))
+for n,ti,su,st in sorted(rows):
+    print(f"- [[{n}]] — {su or ti}{f' [{st}]' if st else ''}")
+PY
+  ;;
+evidence)
+  [ $# -eq 0 ] && { echo "usage: mdream evidence 词1 [词2 ...]" >&2; exit 2; }
+  [ -d "$TRANS" ] || { echo "no transcripts dir: $TRANS" >&2; exit 2; }
+  pats=(); for w in "$@"; do pats+=(-e "$w"); done
+  # JSONL 行极长：只保留命中行前 240 字符，避免把整条 transcript 灌进 context
+  grep -rni "${pats[@]}" "$TRANS" 2>/dev/null | cut -c1-240 | head -25
+  ;;
+hub-check)
+  field_ok
+  python3 - "$FIELD" <<'PY'
+import glob,os,re,sys
+d=sys.argv[1]
+names={os.path.basename(p)[:-3] for p in glob.glob(os.path.join(d,"*.md"))}
+hub=os.path.join(d,"memoryfield-hub.md")
+if not os.path.exists(hub): print("no hub page: memoryfield-hub.md"); sys.exit(1)
+def body(p):
+    t=open(p,encoding="utf-8",errors="ignore").read()
+    return (t.split("---\n",2)[1],t) if t.startswith("---\n") else ("",t)
+hfm,hbody=body(hub)
+linked=set(re.findall(r"\[\[([a-z0-9-]+)\]\]",hbody))
+nonobs=[]; dang={}
+for p in glob.glob(os.path.join(d,"*.md")):
+    n=os.path.basename(p)[:-3]; fm,t=body(p)
+    if re.search(r"^status:.*obsolete",fm,re.M): continue
+    nonobs.append(n)
+    for l in re.findall(r"\[\[([a-z0-9-]+)\]\]",t):
+        if l not in names: dang.setdefault(n,[]).append(l)
+miss=sorted(set(nonobs)-linked-{"index","memoryfield-hub"})
+print(f"pages(non-obsolete)={len(nonobs)} hub_links={len(linked)}")
+print("hub 未收录:", miss or "none")
+print("死链:", dang or "none")
+PY
+  ;;
+*)
+  sed -n '2,12p' "$0"; exit 2 ;;
+esac
+
+# 会改动记忆页的子命令跑完后推一版镜像到 db9（后台）
+case "$cmd" in
+  status) nohup "${MF_SYNC:-$HOME/.local/bin/mf-sync}" --sync >/dev/null 2>&1 & ;;   # mf-sync hook
+esac

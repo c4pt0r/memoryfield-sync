@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# msearch — memoryfield 检索（OR 语义，按命中行数排序）
+# usage: msearch [--field PATH] [--full] 词1 [词2 ...]
+# 关键：多词必须拆成多个 -e；写成 "词A 词B" 会被当成一个短语，通常零命中。
+set -uo pipefail
+
+FIELD="${MEMORYFIELD:-$HOME/.memoryfields/work}"
+full=0
+words=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --field) FIELD="$2"; shift 2 ;;
+    --full)  full=1; shift ;;
+    -h|--help) sed -n '2,5p' "$0"; exit 0 ;;
+    *) words+=("$1"); shift ;;
+  esac
+done
+
+if [ ${#words[@]} -eq 0 ]; then
+  echo "usage: msearch [--field PATH] [--full] 词1 [词2 ...]" >&2
+  exit 2
+fi
+if [ ! -d "$FIELD" ]; then
+  echo "no such field: $FIELD" >&2
+  exit 2
+fi
+
+pats=()
+for w in "${words[@]}"; do pats+=(-e "$w"); done
+
+hits=()
+while IFS= read -r line; do [ -n "$line" ] && hits+=("$line"); done \
+  < <(grep -ril "${pats[@]}" "$FIELD"/*.md 2>/dev/null)
+
+if [ ${#hits[@]} -eq 0 ]; then
+  echo "no match: ${words[*]}" >&2
+  exit 1
+fi
+
+ranked=()
+while IFS= read -r line; do [ -n "$line" ] && ranked+=("$line"); done \
+  < <(for h in "${hits[@]}"; do
+        c=$(grep -ic "${pats[@]}" "$h" 2>/dev/null || echo 0)
+        printf '%s\t%s\n' "$c" "$h"
+      done | sort -rn | cut -f2-)
+
+echo "field: $FIELD  query: ${words[*]}  hits: ${#ranked[@]}"
+for h in "${ranked[@]}"; do
+  echo
+  echo "### $(basename "$h")"
+  awk '/^---$/{f=!f;next} f && /^(title|summary|status|status_reason):/' "$h"
+  if [ "$full" = 1 ]; then
+    echo "--- body ---"
+    awk '/^---$/{n++;next} n>=2' "$h"
+  fi
+done
