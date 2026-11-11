@@ -53,7 +53,7 @@ EOF
 echo "config:    ~/.config/memoryfield-sync/env (MEMORYFIELD=$FIELD, db=$DB)"
 
 if [ ! -d "$FIELD" ]; then
-  echo "note: field dir $FIELD does not exist yet — create it (mkdir -p) before the first sync."
+  mkdir -p "$FIELD" && echo "created field dir: $FIELD (first --sync will pull everything the hub has for field '$(basename "$FIELD")')"
 fi
 
 # --- connectivity check -------------------------------------------------------

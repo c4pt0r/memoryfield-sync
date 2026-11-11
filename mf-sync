@@ -236,9 +236,26 @@ def main():
     start = int(datetime.datetime.now().timestamp())
 
     field = os.path.abspath(os.path.expanduser(a.field))
+    created_field = False
     if not os.path.isdir(field):
-        print("no such field: %s" % field, file=sys.stderr)
-        return 2
+        # A fresh machine has no field dir at all. Create it (mkdir -p) when it is under $HOME
+        # or when its parent already exists, so a typo in --field can't spawn junk trees.
+        home = os.path.abspath(os.path.expanduser("~"))
+        under_home = field == home or field.startswith(home + os.sep)
+        if under_home or os.path.isdir(os.path.dirname(field)):
+            if a.dry_run:
+                print("note: field dir %s does not exist; --sync would create it" % field,
+                      file=sys.stderr)
+            else:
+                os.makedirs(field, exist_ok=True)
+                created_field = True
+                print("created field dir: %s (fresh machine? --sync pulls the hub into it)" % field,
+                      file=sys.stderr)
+        else:
+            print("no such field: %s  (parent %s missing too; mkdir -p it, or pass --field "
+                  "inside $HOME)" % (field, os.path.dirname(field)), file=sys.stderr)
+            return 2
+    field = os.path.abspath(field)
     fldname = os.path.basename(field)
     fld = q(fldname)
     state_path = os.path.join(field, ".db9-sync-state.json")
@@ -427,10 +444,11 @@ def main():
 
             mode = "sync" if a.sync else ("pull" if a.pull else "push")
             print("[mf-sync] db=%s field=%s host=%s mode=%s scanned=%d pushed=%d pulled=%d "
-                  "conflicts=%d tombstoned=%d deleted_locally=%d%s ok"
+                  "conflicts=%d tombstoned=%d deleted_locally=%d%s%s ok"
                   % (a.db, fldname, a.host, mode, len(local),
                      len([x for x in push if x[0] == "put"]), pulled, len(conflicts), tomb,
-                     len(honor_slugs), " DRY-RUN" if a.dry_run else ""))
+                     len(honor_slugs), " DRY-RUN" if a.dry_run else "",
+                     " (created field dir)" if created_field else ""))
             if conflicts and a.strict:
                 return 1
             return 0
