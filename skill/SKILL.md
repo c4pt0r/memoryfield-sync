@@ -4,7 +4,7 @@ description: >-
   本机 memoryfield 记忆场（~/.memoryfields/work）的读写、检索与跨机器同步：查既往工作结论、
   本机工具链事实、配置/版本历史、踩过的坑、已验证的操作流程；把新结论写成合规的 Markdown 页并同步到
   db9 hub（多机器共用同一份记忆，工具 github.com/c4pt0r/memoryfield-sync）。当用户问"上次怎么做的"
-  "之前那个版本/配置是什么""你还记得…"，要求记住/沉淀某条经验，或提到 memoryfield、记忆场、
+  "之前那个版本/配置是什么""你还记得…""在记忆里"、问自己的固定行程/偏好，要求记住/沉淀某条经验，或提到 memoryfield、记忆场、
   ~/.memoryfields、换机器、同步记忆时使用。
 metadata:
   fields: ["work"]
@@ -21,7 +21,9 @@ metadata:
 
 ## 四条铁律
 
-1. 答既往工作/本机工具链事实前先 `msearch`，未命中再凭印象答或重查。
+1. **recall 前强制同步**：答既往工作/本机工具链/用户日程偏好等事实前，先 `msearch`——它会**先跑
+   `mf-sync --sync` 再 grep**（别的机器上刚写的页也能查到）。不用 `msearch`、自己 grep/awk/cat
+   场里的页时，必须先手动 `mf-sync --sync`。未命中再凭印象答或重查；同步告警要告诉用户结果可能不新。
 2. 产生可复用事实/踩坑/已验证流程 → `mnew` 写页，**写完 `mf-sync --sync`**（见「同步」）。
 3. 结论变了**不删页**：标 `status:` + `status_reason:`，并改 `memoryfield-hub.md`。
 4. 冲突不覆盖：`mf-sync` 只会把对端版本放进 `.conflicts/`，合并由你（或 agent）手工做。
@@ -33,10 +35,14 @@ metadata:
 ~/.agents/skills/local-memoryfield/scripts/msearch --full 词1     # 带正文
 ```
 
+`msearch` 开头**强制同步**：同步跑 `mf-sync --sync`（stderr 打一行结果），失败只告警、照常检索本地副本；
+同一轮里连续多次检索可用 `--no-sync`（或 `MSEARCH_NO_SYNC=1`）跳过，但**每轮任务的第一次 recall 不许跳**。
+
 `msearch` 把多词拆成多个 `-e`（OR 语义）并按命中行数排序。**绝不要**写 `grep -e "词A 词B"`
 （那是一个短语，通常零命中）。只枚举有哪些页（低成本，别把全部 title+summary 灌进 context）：
 
 ```bash
+mf-sync --sync                                    # 手动枚举/grep 前同样先同步
 ls ~/.memoryfields/work/*.md | wc -l
 awk '/^---$/{f=!f;next} f && /^(title|summary|status):/' ~/.memoryfields/work/*.md
 ```

@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # msearch — memoryfield 检索（OR 语义，按命中行数排序）
-# usage: msearch [--field PATH] [--full] 词1 [词2 ...]
+# usage: msearch [--field PATH] [--full] [--no-sync] 词1 [词2 ...]
 # 关键：多词必须拆成多个 -e；写成 "词A 词B" 会被当成一个短语，通常零命中。
+# recall 前强制先 `mf-sync --sync`（同步失败只告警、照常检索本地）；--no-sync / MSEARCH_NO_SYNC=1 跳过。
 set -uo pipefail
 
 FIELD="${MEMORYFIELD:-$HOME/.memoryfields/work}"
 full=0
+nosync="${MSEARCH_NO_SYNC:-0}"
 words=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --field) FIELD="$2"; shift 2 ;;
     --full)  full=1; shift ;;
-    -h|--help) sed -n '2,5p' "$0"; exit 0 ;;
+    --no-sync) nosync=1; shift ;;
+    -h|--help) sed -n '2,6p' "$0"; exit 0 ;;
     *) words+=("$1"); shift ;;
   esac
 done
@@ -21,6 +24,24 @@ if [ ${#words[@]} -eq 0 ]; then
   echo "usage: msearch [--field PATH] [--full] 词1 [词2 ...]" >&2
   exit 2
 fi
+
+# --- forced pre-recall sync: pull other machines' pages before grepping -------
+if [ "$nosync" != 1 ]; then
+  [ -d /opt/homebrew/bin ] && PATH="/opt/homebrew/bin:$PATH"   # psql from keg-only libpq
+  MFS="${MF_SYNC:-$HOME/.local/bin/mf-sync}"
+  [ -x "$MFS" ] || MFS="$(command -v mf-sync 2>/dev/null || true)"
+  if [ -n "$MFS" ] && [ -x "$MFS" ]; then
+    if out=$("$MFS" --sync --field "$FIELD" 2>&1); then
+      echo "$out" | tail -1 >&2
+    else
+      echo "msearch: WARNING pre-recall sync failed, results may be stale:" >&2
+      echo "$out" | tail -3 | sed 's/^/  /' >&2
+    fi
+  else
+    echo "msearch: WARNING mf-sync not found, searching local copy only" >&2
+  fi
+fi
+
 if [ ! -d "$FIELD" ]; then
   echo "no such field: $FIELD" >&2
   exit 2
