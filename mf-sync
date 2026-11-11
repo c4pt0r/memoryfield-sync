@@ -27,6 +27,27 @@ the run exits non-zero under --strict so the timer log shows it.
 from __future__ import annotations
 import argparse, base64, datetime, hashlib, json, os, re, socket, subprocess, sys, tempfile
 
+def load_conf():
+    """source ~/.config/memoryfield-sync/env (written by install.sh) so machines without a
+    systemd unit (macOS/launchd/cron) still know their field and database. Real env wins."""
+    p = os.path.join(os.path.expanduser("~"), ".config", "memoryfield-sync", "env")
+    if not os.path.isfile(p):
+        return
+    try:
+        for line in open(p, encoding="utf-8"):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), os.path.expandvars(v.strip().strip('"').strip("'"))
+            if k in ("MEMORYFIELD", "MEMORYFIELD_DB9", "MF_SYNC") and k not in os.environ:
+                os.environ[k] = v
+    except Exception:
+        pass
+
+
+load_conf()
+
 DEFAULT_FIELD = os.path.expanduser(os.environ.get("MEMORYFIELD", "~/.memoryfields/work"))
 DEFAULT_DB = os.environ.get("MEMORYFIELD_DB9", "memoryfield")
 HERE = os.path.dirname(os.path.abspath(os.path.realpath(__file__)))
@@ -265,7 +286,7 @@ def main():
         state = {}
 
     local = {}
-    for fn in sorted(os.listdir(field)):
+    for fn in (sorted(os.listdir(field)) if os.path.isdir(field) else []):
         if fn.endswith(".md"):
             p = parse_page(os.path.join(field, fn))
             local[p["slug"]] = p

@@ -7,7 +7,8 @@
 #   ./install.sh --db memoryfield --field ~/.memoryfields/work --interval 5
 #   ./install.sh --no-timer            # only install mf-sync
 #   ./install.sh --hooks               # also patch the local-memoryfield skill hooks (mnew/mdream)
-#   ./install.sh --cron                # use a crontab line instead of a systemd user timer
+#   ./install.sh --launchd             # force a macOS LaunchAgent (default on macOS)
+#   ./install.sh --cron                # crontab line instead of timer/LaunchAgent
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,6 +18,7 @@ INTERVAL=5
 TIMER=1
 HOOKS=0
 USE_CRON=0
+USE_LAUNCHD=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -25,6 +27,7 @@ while [ $# -gt 0 ]; do
     --interval) INTERVAL="$2"; shift 2 ;;
     --no-timer) TIMER=0; shift ;;
     --cron)     USE_CRON=1; shift ;;
+    --launchd)  USE_LAUNCHD=1; shift ;;
     --hooks)    HOOKS=1; shift ;;
     -h|--help)  sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -66,7 +69,47 @@ else
 fi
 
 # --- periodic sync ------------------------------------------------------------
-if [ $TIMER = 1 ] && [ $USE_CRON = 0 ] && systemctl --user is-system-running >/dev/null 2>&1; then
+# macOS has no systemd user instance: use a LaunchAgent (StartInterval).
+if [ $TIMER = 1 ] && { [ $USE_LAUNCHD = 1 ] || { [ "$(uname -s)" = Darwin ] && [ $USE_CRON = 0 ]; }; }; then
+  LABEL="com.c4pt0r.memoryfield-sync"
+  PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+  LOGDIR="$HOME/.local/state/memoryfield-sync"
+  mkdir -p "$HOME/Library/LaunchAgents" "$LOGDIR"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>. $HOME/.config/memoryfield-sync/env; exec '$HERE/mf-sync' --sync --strict</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>$HOME</string>
+    <key>PATH</key><string>$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>MEMORYFIELD</key><string>$FIELD</string>
+    <key>MEMORYFIELD_DB9</key><string>$DB</string>
+  </dict>
+  <key>StartInterval</key><integer>$((INTERVAL * 60))</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$LOGDIR/launchd.out.log</string>
+  <key>StandardErrorPath</key><string>$LOGDIR/launchd.err.log</string>
+</dict>
+</plist>
+EOF
+  if [ "$(uname -s)" = Darwin ]; then
+    launchctl unload "$PLIST" 2>/dev/null || true
+    launchctl load -w "$PLIST"
+    echo "launchd: $LABEL loaded every ${INTERVAL}min (mode=--sync)"
+    echo "         tail -f $LOGDIR/launchd.err.log"
+  else
+    echo "launchd: wrote $PLIST (not macOS, not loaded)"
+  fi
+elif [ $TIMER = 1 ] && [ $USE_CRON = 0 ] && systemctl --user is-system-running >/dev/null 2>&1; then
   U="$HOME/.config/systemd/user"
   mkdir -p "$U"
   cat > "$U/memoryfield-db9-sync.service" <<EOF
@@ -102,8 +145,9 @@ EOF
   echo "timer:     memoryfield-db9-sync.timer every ${INTERVAL}min (mode=--sync)"
   echo "           journalctl --user -u memoryfield-db9-sync.service -f"
 elif [ $TIMER = 1 ]; then
-  echo "no systemd user instance; add this crontab line instead:"
-  echo "  */$INTERVAL * * * * $HERE/mf-sync --sync --strict --field $FIELD --db $DB >/dev/null 2>&1"
+  echo "no systemd user instance; add this crontab line instead (note: cron's HOME/PATH are bare,"
+  echo "  db9 needs HOME, so prefer the LaunchAgent above or set them in the line):"
+  echo "  */$INTERVAL * * * * HOME=$HOME PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin $HERE/mf-sync --sync --strict --field $FIELD --db $DB >>$HOME/.memoryfield-sync-cron.log 2>&1"
 fi
 
 # --- optional skill hooks -----------------------------------------------------

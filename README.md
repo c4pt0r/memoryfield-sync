@@ -45,6 +45,18 @@ cd ~/memoryfield-sync && ./install.sh          # symlink + systemd user timer (5
 It writes `~/.config/memoryfield-sync/env` (sourced by the systemd unit) and symlinks
 `mf-sync` into `~/.local/bin`.
 
+### macOS
+
+There is no systemd user instance, so `install.sh` installs a **LaunchAgent** instead
+(`~/Library/LaunchAgents/com.c4pt0r.memoryfield-sync.plist`, `StartInterval`, `RunAtLoad`,
+logs in `~/.local/state/memoryfield-sync/`). Force it with `--launchd`, or force the crontab
+form with `--cron` (cron has a bare `HOME`/`PATH` — `db9` needs `HOME`, or it silently
+bootstraps a fresh *anonymous* account, so set both in the cron line).
+
+`psql` usually comes from Homebrew `libpq`, which is keg-only: add `/opt/homebrew/bin` to
+`PATH` (the LaunchAgent already does). `mf-sync` also reads
+`~/.config/memoryfield-sync/env`, so a bare `mf-sync` works in any shell on that machine.
+
 ### Joining from a second machine
 
 Same db9 account, same database, same **field name** (the directory basename is the key):
@@ -56,7 +68,9 @@ git clone ... && ./install.sh --db memoryfield --field ~/.memoryfields/work
 mf-sync --sync --dry-run           # preview before letting it write files
 ```
 
-A fresh machine with an empty field will pull everything on its first `--sync`.
+A fresh machine needs no field directory: `mf-sync` creates it (`mkdir -p` when the path is
+under `$HOME` or its parent exists) and pulls the hub into it. Verified: first run on an empty
+machine created the dir and pulled 132 pages byte-identical, the second run was a no-op.
 
 ## Commands
 
